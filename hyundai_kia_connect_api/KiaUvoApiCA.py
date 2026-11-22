@@ -1894,12 +1894,41 @@ class KiaUvoApiCA(ApiImpl):
             }
         return body
 
+    def _refresh_departures(self, token: Token, vehicle: Vehicle) -> None:
+        """Load the saved departure slots from getresdetails.
+
+        lstvhclsts can report different days than what the car has saved
+        (a 2026 EV9 showed every day where getresdetails had Mon/Tue/Thu/Fri),
+        so unset options must be filled from the saved schedule, not status.
+        """
+        try:
+            _, response_json = self._ca_call(
+                token, vehicle, "v2/rc/ev/getresdetails", method="GET"
+            )
+        except Exception as err:
+            _LOGGER.debug(f"{DOMAIN} - getresdetails failed, using status: {err}")
+            return
+        result = response_json.get("result") or {}
+        infos: dict[str, Any] = {}
+        for _, status_key, body_key in _CA_DEPARTURE_SLOTS:
+            slot = result.get(body_key)
+            if isinstance(slot, dict):
+                infos[status_key] = {
+                    "reservChargeInfoDetail": {
+                        "reservChargeSet": slot.get("reservHVACflag") == 1,
+                        "reservInfo": slot.get("reservInfo") or {},
+                        "reservFatcSet": slot.get("reservHVACSet") or {},
+                    }
+                }
+        self._update_departures(vehicle, infos)
+
     def _set_departures(
         self,
         token: Token,
         vehicle: Vehicle,
         options: ScheduleChargingClimateRequestOptions,
     ) -> str:
+        self._refresh_departures(token, vehicle)
         _fill_schedule_options_from_vehicle(options, vehicle, scopes=("climate",))
         assert options.first_departure is not None
         assert options.second_departure is not None
@@ -1967,18 +1996,20 @@ class KiaUvoApiCA(ApiImpl):
     def valet_mode_action(
         self, token: Token, vehicle: Vehicle, action: VALET_MODE_ACTION
     ) -> str:
-        """valet/activate | valet/deactivate.
+        """valet/activate | valet/deactivate (PIN body, like other remote commands).
 
-        The endpoints are registered in the kiaconnect.ca bundle but the page
-        that calls them is not in the web app, so the body (PIN only, like the
-        other remote commands) is inferred.
+        Not called by the kiaconnect.ca web app; verified live on a 2026 EV9,
+        where the session shows up in valet/lastvaletstatus.
         """
         path = (
             "valet/activate"
             if action == VALET_MODE_ACTION.ACTIVATE
             else "valet/deactivate"
         )
-        return self._ca_command(token, vehicle, path, {"pin": token.pin})
+        transaction_id = self._ca_command(token, vehicle, path, {"pin": token.pin})
+        if vehicle.data is not None:
+            vehicle.data.pop("_ca_extras_at", None)  # re-read valet status next update
+        return transaction_id
 
     def set_last_service(
         self,
@@ -2062,6 +2093,13 @@ class KiaUvoApiCA(ApiImpl):
             },
         }
         _add_steering_wheel_step(setting, options)
+        # As kiaconnect.ca does: a new preset carries no id, and cars with a
+        # 2-step wheel (steering level sent) carry no heating1. The server
+        # rejected both (2026 EV9).
+        if not favourite_id:
+            del setting["id"]
+        if options.steering_wheel is not None:
+            del setting["heating1"]
         self._ca_call(token, vehicle, "svfvsttng", {"setting": setting})
 
     def delete_climate_favourite(
@@ -2082,15 +2120,18 @@ class KiaUvoApiCA(ApiImpl):
         return day
 
     def get_valet_mode(self, token: Token, vehicle: Vehicle) -> bool | None:
-        """valet/lastvaletstatus -> {"valetMode": n}.
+        """valet/lastvaletstatus: the last valet session.
 
-        A 2026 EV9 that was not in valet mode reported 1 (and vhcllst
-        valetParkingModeOn 1), so 1 is read as inactive and 0 as active.
-        Note the EU GSPA enum differs (0 active, 1 ign-off, 2 inactive).
+        valetMode is not an on/off flag: a 2026 EV9 reported 1 before, during
+        and after a session. A session is active when it has a startDate and
+        no deactivatedDate (verified with a live activate/deactivate).
         """
         _, response_json = self._ca_call(token, vehicle, "valet/lastvaletstatus")
-        mode = get_child_value(response_json, "result.valetMode")
-        vehicle.valet_mode_active = False if mode == 1 else True if mode == 0 else None
+        result = response_json.get("result") or {}
+        if result.get("startDate"):
+            vehicle.valet_mode_active = not result.get("deactivatedDate")
+        else:
+            vehicle.valet_mode_active = False  # no session recorded
         return vehicle.valet_mode_active
 
     def get_preferred_dealer(self, token: Token, vehicle: Vehicle) -> dict[str, Any]:
@@ -2194,4 +2235,26 @@ class KiaUvoApiCA(ApiImpl):
         for key in sensitive_keys:
             if key in masked:
                 masked[key] = "****"
+        location_keys = {
+            "coordLat",
+            "coordLon",
+            "lat",
+            "lon",
+            "lng",
+            "latitude",
+            "longitude",
+        }
+
+        def _scrub(value: Any) -> None:
+            if isinstance(value, dict):
+                for key in list(value):
+                    if key in location_keys:
+                        value[key] = "****"
+                    else:
+                        _scrub(value[key])
+            elif isinstance(value, list):
+                for item in value:
+                    _scrub(item)
+
+        _scrub(masked)
         return masked

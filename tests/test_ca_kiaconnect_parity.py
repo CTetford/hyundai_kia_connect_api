@@ -238,7 +238,8 @@ def test_climate_favourite_calls(sent) -> None:
     paths = [c["url"].rsplit("/", 1)[-1] for c in sent]
     assert paths == ["svfvsttng", "rmfvsttng", "svdefaultfvsttng", "svmvrdy"]
     setting = _body(sent[0])["setting"]
-    assert setting["id"] == 0
+    assert "id" not in setting  # new preset: no id, like the portal
+    assert "heating1" not in setting  # 2-step wheel: no heating1
     assert setting["settingName"] == "Max heat for the whol"[:20]
     assert setting["airTemp"] == {"value": "10H", "unit": 0, "hvacTempType": 1}
     assert setting["steerWheelHeat_step2"] == 2
@@ -271,7 +272,12 @@ def reply(monkeypatch):
 def test_account_extras(reply) -> None:
     reply.update(
         {
-            "valet/lastvaletstatus": {"vehicleId": "V", "valetMode": 1},
+            "valet/lastvaletstatus": {
+                "vehicleId": "V",
+                "valetMode": 1,
+                "startDate": "20261122035915",
+                "deactivatedDate": "20261122040016",
+            },
             "gtprfrdlr": {"dealerCode": "53069", "dealerName": "Dealer"},
             "ntcmsgcnt": {"count": 2},
             "v2/ntfhst": {"vehicleId": "V", "notifications": [{"a": 1}]},
@@ -340,3 +346,114 @@ def test_charge_limits_keep_setsoc_for_older_generations(sent) -> None:
     vehicle.generation = "G2"
     _api().set_charge_limits(_token(), vehicle, ac=80, dc=70)
     assert sent[-1]["url"].endswith("evc/setsoc")
+
+
+@pytest.mark.parametrize(
+    ("result", "active"),
+    [
+        ({"valetMode": 1}, False),
+        ({"valetMode": 1, "startDate": "20261122035915"}, True),
+        (
+            {
+                "valetMode": 1,
+                "startDate": "20261122035915",
+                "deactivatedDate": "20261122040016",
+            },
+            False,
+        ),
+    ],
+)
+def test_valet_status_from_session_log(reply, result, active) -> None:
+    reply["valet/lastvaletstatus"] = result
+    vehicle = _vehicle()
+    assert _api().get_valet_mode(_token(), vehicle) is active
+    assert vehicle.valet_mode_active is active
+
+
+def test_valet_command_rereads_account_data(sent) -> None:
+    vehicle = _vehicle()
+    vehicle.data = {"_ca_extras_at": 1.0}
+    _api().valet_mode_action(_token(), vehicle, VALET_MODE_ACTION.ACTIVATE)
+    assert "_ca_extras_at" not in vehicle.data
+
+
+def test_update_existing_preset_keeps_id(sent) -> None:
+    _api().save_climate_favourite(
+        _token(),
+        _vehicle(),
+        "Winter",
+        ClimateRequestOptions(set_temp=21.0, heating=0),
+        446244,
+    )
+    setting = _body(sent[-1])["setting"]
+    assert setting["id"] == 446244
+    assert setting["heating1"] == 0  # no wheel level given: legacy heating kept
+
+
+def test_location_masked_in_logs() -> None:
+    masked = _api()._mask_sensitive_data(
+        {
+            "result": {"currentLocation": {"coordLat": 44.1, "coordLon": -78.9}},
+            "pin": "1",
+        }
+    )
+    assert masked["pin"] == "****"
+    assert masked["result"]["currentLocation"] == {
+        "coordLat": "****",
+        "coordLon": "****",
+    }
+
+
+def test_departure_write_fills_from_saved_schedule(monkeypatch) -> None:
+    """Unset slot fields come from getresdetails, not lstvhclsts."""
+    saved = {
+        "reservedHVACInfo1": {
+            "reservHVACflag": 0,
+            "reservInfo": {
+                "day": [1, 2, 4, 5],
+                "time": {"time": "0520", "timeSection": 0},
+            },
+            "reservHVACSet": {
+                "airCtrl": 1,
+                "defrost": True,
+                "airTemp": {"value": "23.0", "unit": 0},
+            },
+        },
+        "reservedHVACInfo2": {
+            "reservHVACflag": 0,
+            "reservInfo": {"day": [9], "time": {"time": "1200", "timeSection": 0}},
+            "reservHVACSet": {
+                "airCtrl": 1,
+                "defrost": False,
+                "airTemp": {"value": "20.0", "unit": 0},
+            },
+        },
+    }
+    calls: list[tuple[str, Any]] = []
+
+    def fake_call(self, token, vehicle, path, body=None, *, method="POST", pin=False):
+        calls.append((path, body))
+        result = saved if path.endswith("getresdetails") else {"pAuth": "x"}
+        return {"transactionId": "TX-1"}, {
+            "responseHeader": {"responseCode": 0},
+            "result": result,
+        }
+
+    monkeypatch.setattr(KiaUvoApiCA, "_ca_call", fake_call)
+    vehicle = _vehicle()
+    vehicle.ev_first_departure_days = [0, 1, 2, 3, 4, 5, 6]  # stale status value
+    options = ScheduleChargingClimateRequestOptions(
+        second_departure=Departure(enabled=False)
+    )
+    _api().schedule_charging_and_climate(_token(), vehicle, options)
+    body = calls[-1][1]
+    assert calls[-1][0] == "v2/rc/ev/reshvacset"
+    assert body["reservedHVACInfo1"]["reservInfo"]["day"] == [1, 2, 4, 5]
+    assert body["reservedHVACInfo1"]["reservInfo"]["time"] == {
+        "time": "0520",
+        "timeSection": 0,
+    }
+    assert body["reservedHVACInfo2"]["reservInfo"] == {
+        "day": [9],
+        "time": {"time": "1200", "timeSection": 0},  # 12 AM, as saved
+    }
