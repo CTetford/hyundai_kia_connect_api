@@ -41,6 +41,7 @@ from .const import (
     OTP_NOTIFY_TYPE,
     SEAT_STATUS,
     TEMPERATURE_UNITS,
+    VALET_MODE_ACTION,
     VEHICLE_LOCK_ACTION,
 )
 from .exceptions import (
@@ -114,6 +115,26 @@ def _add_steering_wheel_step(
         return
     body["steerWheelHeat_step2"] = int(options.steering_wheel)
     body["sideBackWindowHeat"] = 1 if options.heating in (1, 2, 4) else 0
+
+
+def _ymd_date(value: Any) -> dt.date | None:
+    """CA dates are YYYYMMDD strings; anything else is unknown."""
+    raw = str(value or "")
+    if len(raw) != 8 or not raw.isdigit():
+        return None
+    try:
+        return dt.date(int(raw[:4]), int(raw[4:6]), int(raw[6:]))
+    except ValueError:
+        return None
+
+
+# Departure slots in lstvhclsts / getresdetails (slot number, status key, body key)
+_CA_DEPARTURE_SLOTS = (
+    (1, "reservChargeInfo", "reservedHVACInfo1"),
+    (2, "reserveChargeInfo2", "reservedHVACInfo2"),
+)
+# reservInfo.day holds 0-6 (Sun=0); 9 is the portal's "no day" marker.
+_CA_NO_DAY = 9
 
 
 def create_session_ticket_context() -> ssl.SSLContext:
@@ -740,8 +761,13 @@ class KiaUvoApiCA(ApiImpl):
                 dtc_count=entry["dtcCount"],
                 generation=entry.get("genType"),
             )
+            vehicle.connect_subscription_end_date = _ymd_date(
+                entry.get("subscriptionEndDate")
+            )
             vehicle.supports.window_control = False
-            vehicle.supports.valet_mode = False
+            # kiaconnect.ca exposes valet/activate, valet/deactivate and
+            # valet/lastvaletstatus (see valet_mode_action).
+            vehicle.supports.valet_mode = True
             vehicle.supports.svm = False
             result.append(vehicle)
         return result
@@ -783,6 +809,7 @@ class KiaUvoApiCA(ApiImpl):
             self._update_vehicle_properties_charge(vehicle, charge)
             self._update_vehicle_properties_trip_details(token, vehicle)
             self._update_charge_schedule(token, vehicle)
+            self._update_account_extras(token, vehicle)
 
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
         state = self._get_forced_vehicle_state(token, vehicle)
@@ -848,6 +875,7 @@ class KiaUvoApiCA(ApiImpl):
             self._update_vehicle_properties_charge(vehicle, charge)
             self._update_vehicle_properties_trip_details(token, vehicle)
             self._update_charge_schedule(token, vehicle)
+            self._update_account_extras(token, vehicle)
 
     def _update_maintenance_report(self, token: Token, vehicle: Vehicle) -> None:
         """Fetch the newest monthly maintenance report when a new one appears.
@@ -1148,9 +1176,91 @@ class KiaUvoApiCA(ApiImpl):
         vehicle.fuel_level_is_low = get_child_value(state, "status.lowFuelLight")
         vehicle.fuel_level = get_child_value(state, "status.fuelLevel")
         vehicle.air_control_is_on = get_child_value(state, "status.airCtrlOn")
+        vehicle.smart_key_battery_warning_is_on = get_child_value(
+            state, "status.smartKeyBatteryWarning"
+        )
+        oil = get_child_value(state, "status.engineOilStatus")
+        if oil is not None:
+            vehicle.oil_level_warning_is_on = bool(oil)
+        soh = get_child_value(state, "status.evStatus.batterySoh")
+        if soh is not None:
+            vehicle.ev_battery_soh_percentage = int_or_none(soh)
+        discharge_limit = get_child_value(state, "status.evStatus.dischargingLimit")
+        if discharge_limit is not None:
+            vehicle.ev_v2l_discharge_limit = int_or_none(discharge_limit)
+        self._update_departures(
+            vehicle, get_child_value(state, "status.evStatus.reservChargeInfos")
+        )
         if vehicle.data is None:
             vehicle.data = {}
         vehicle.data["status"] = state["status"]
+
+    def _departure_temperature(self, vehicle: Vehicle, raw: Any) -> float | None:
+        """lstvhclsts reports "23.0"; schedule bodies use the hex index ("10H")."""
+        if raw is None:
+            return None
+        text = str(raw)
+        if text.upper().endswith("H"):
+            index = get_hex_temp_into_index(text)
+            table = (
+                self.temperature_range_c_new
+                if vehicle.year is not None
+                and vehicle.year >= self.temperature_range_model_year
+                else self.temperature_range_c_old
+            )
+            if index is None or not 0 <= index < len(table):
+                return None
+            return table[index]
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _update_departures(self, vehicle: Vehicle, infos: Any) -> None:
+        """Departure (scheduled climate) slots from reservChargeInfos."""
+        if not isinstance(infos, dict):
+            return
+        for number, status_key, _ in _CA_DEPARTURE_SLOTS:
+            detail = get_child_value(infos, f"{status_key}.reservChargeInfoDetail")
+            if not isinstance(detail, dict):
+                continue
+            prefix = "first" if number == 1 else "second"
+            days = get_child_value(detail, "reservInfo.day") or []
+            fatc = detail.get("reservFatcSet") or {}
+            setattr(
+                vehicle,
+                f"ev_{prefix}_departure_enabled",
+                bool(detail.get("reservChargeSet")),
+            )
+            setattr(
+                vehicle,
+                f"ev_{prefix}_departure_days",
+                sorted(d for d in days if isinstance(d, int) and 0 <= d <= 6),
+            )
+            setattr(
+                vehicle,
+                f"ev_{prefix}_departure_time",
+                _reservation_time(get_child_value(detail, "reservInfo.time")),
+            )
+            setattr(
+                vehicle,
+                f"ev_{prefix}_departure_climate_enabled",
+                bool(fatc.get("airCtrl")),
+            )
+            setattr(
+                vehicle,
+                f"ev_{prefix}_departure_climate_defrost",
+                bool(fatc.get("defrost")),
+            )
+            temperature = self._departure_temperature(
+                vehicle, get_child_value(fatc, "airTemp.value")
+            )
+            if temperature is not None:
+                setattr(
+                    vehicle,
+                    f"ev_{prefix}_departure_climate_temperature",
+                    (temperature, TEMPERATURE_UNITS[0]),
+                )
 
     def _update_vehicle_properties_service(
         self, vehicle: Vehicle, state: dict[str, Any]
@@ -1166,6 +1276,14 @@ class KiaUvoApiCA(ApiImpl):
         vehicle.last_service_distance = (
             get_child_value(state, "msopServiceOdometer"),
             DISTANCE_UNITS[get_child_value(state, "msopServiceOdometerUnit")],
+        )
+        vehicle.next_service_date = _ymd_date(get_child_value(state, "mtitServiceDate"))
+        vehicle.last_service_date = _ymd_date(get_child_value(state, "mtspServiceDate"))
+        vehicle.service_interval_distance = get_child_value(
+            state, "serviceOdometerDuration"
+        )
+        vehicle.service_interval_months = int_or_none(
+            get_child_value(state, "serviceMonthsThreshold")
         )
 
         if vehicle.data is None:
@@ -1686,20 +1804,31 @@ class KiaUvoApiCA(ApiImpl):
         vehicle: Vehicle,
         options: ScheduleChargingClimateRequestOptions,
     ) -> str:
-        """Set the charge window (v2/rc/ev/reschargeset); departures are not supported."""
+        """Charge window (v2/rc/ev/reschargeset) and departures (v2/rc/ev/reshvacset).
+
+        Each scope is only sent when one of its options was given. When both
+        are given, the charge window is written first and the departure
+        transaction id is returned.
+        """
         charge_active, climate_active = _schedule_charging_scopes(options)
-        if climate_active:
-            raise NotImplementedError("Departure/climate schedules are not supported")
-        if not charge_active:
+        if not charge_active and not climate_active:
             raise ValueError("no schedule changes requested")
+        transaction_id = ""
+        if charge_active:
+            transaction_id = self._set_charge_window(token, vehicle, options)
+        if climate_active:
+            transaction_id = self._set_departures(token, vehicle, options)
+        return transaction_id
+
+    def _set_charge_window(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        options: ScheduleChargingClimateRequestOptions,
+    ) -> str:
         _fill_schedule_options_from_vehicle(options, vehicle, scopes=("charge",))
         start, end = options.off_peak_start_time, options.off_peak_end_time
         assert start is not None and end is not None
-        url = self.API_URL + "v2/rc/ev/reschargeset"
-        headers = self.API_HEADERS.copy()
-        headers["accessToken"] = token.access_token
-        headers["vehicleId"] = vehicle.id
-        headers["pAuth"] = self._get_pin_token(token, vehicle)
         payload = {
             "reservFlag": 1 if options.charging_enabled else 0,
             "offpeakPowerFlag": 1 if options.off_peak_charge_only_enabled else 2,
@@ -1707,14 +1836,298 @@ class KiaUvoApiCA(ApiImpl):
             "reservEndTime": _reservation_time_body(end),
             "pin": token.pin,
         }
+        return self._ca_command(token, vehicle, "v2/rc/ev/reschargeset", payload)
+
+    def _departure_body(
+        self,
+        vehicle: Vehicle,
+        departure: ScheduleChargingClimateRequestOptions.DepartureOptions,
+    ) -> dict[str, Any]:
+        """One reservedHVACInfo slot, shaped like kiaconnect.ca sends it.
+
+        The portal drops reservHVACSet for a disabled slot and never sends
+        heating1 in it.
+        """
+        days = sorted({d for d in (departure.days or []) if 0 <= d <= 6})
+        body: dict[str, Any] = {
+            "reservHVACflag": 1 if departure.enabled else 0,
+            "reservInfo": {
+                "day": days or [_CA_NO_DAY],
+                "time": _reservation_time_body(departure.time or dt.time()),
+            },
+        }
+        if departure.enabled:
+            table = (
+                self.temperature_range_c_new
+                if vehicle.year is not None
+                and vehicle.year >= self.temperature_range_model_year
+                else self.temperature_range_c_old
+            )
+            temperature = departure.temperature
+            if temperature is None or temperature not in table:
+                temperature = 21.0
+            # getresdetails returns the slot temperature as "23.0" (unit 0);
+            # send it back in the same form.
+            body["reservHVACSet"] = {
+                "airCtrl": 1 if departure.climate_enabled else 0,
+                "defrost": bool(departure.defrost),
+                "airTemp": {"value": f"{float(temperature):.1f}", "unit": 0},
+            }
+        return body
+
+    def _set_departures(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        options: ScheduleChargingClimateRequestOptions,
+    ) -> str:
+        _fill_schedule_options_from_vehicle(options, vehicle, scopes=("climate",))
+        assert options.first_departure is not None
+        assert options.second_departure is not None
+        payload: dict[str, Any] = {
+            "pin": token.pin,
+            "reservedHVACInfo1": self._departure_body(vehicle, options.first_departure),
+            "reservedHVACInfo2": self._departure_body(
+                vehicle, options.second_departure
+            ),
+        }
+        return self._ca_command(token, vehicle, "v2/rc/ev/reshvacset", payload)
+
+    # ----- kiaconnect.ca account/vehicle features -------------------------
+
+    def _ca_headers(
+        self, token: Token, vehicle: Vehicle | None = None, pin: bool = False
+    ) -> dict[str, Any]:
+        headers = self.API_HEADERS.copy()
+        headers["accessToken"] = token.access_token
+        if vehicle is not None:
+            headers["vehicleId"] = vehicle.id
+            if pin:
+                headers["pAuth"] = self._get_pin_token(token, vehicle)
+        return headers
+
+    def _ca_call(
+        self,
+        token: Token,
+        vehicle: Vehicle | None,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        method: str = "POST",
+        pin: bool = False,
+    ) -> tuple[Any, dict[str, Any]]:
+        """POST/GET a /tods/api path; returns (response headers, checked JSON)."""
+        url = self.API_URL + path
+        headers = self._ca_headers(token, vehicle, pin)
+        if method == "GET":
+            response = self.sessions.get(url, headers=headers)
+        else:
+            response = self.sessions.post(
+                url, headers=headers, data=json.dumps(body or {})
+            )
+        response_json: dict[str, Any] = response.json()
         _LOGGER.debug(
-            f"{DOMAIN} - Planned reschargeset payload {self._mask_sensitive_data(payload)}"
+            f"{DOMAIN} - {path} response {self._mask_sensitive_data(response_json)}"
         )
-        response = self.sessions.post(url, headers=headers, data=json.dumps(payload))
-        response_json = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Received reschargeset response {response_json}")
         self._check_response_for_errors(response_json)
-        return response.headers["transactionId"]
+        return response.headers, response_json
+
+    def _ca_command(
+        self, token: Token, vehicle: Vehicle, path: str, payload: dict[str, Any]
+    ) -> str:
+        """A PIN-protected vehicle command; returns the transaction id."""
+        _LOGGER.debug(
+            f"{DOMAIN} - Planned {path} payload {self._mask_sensitive_data(payload)}"
+        )
+        headers, response_json = self._ca_call(token, vehicle, path, payload, pin=True)
+        return cast(
+            str,
+            headers.get("transactionId") or response_json.get("transactionid") or "",
+        )
+
+    def valet_mode_action(
+        self, token: Token, vehicle: Vehicle, action: VALET_MODE_ACTION
+    ) -> str:
+        """valet/activate | valet/deactivate.
+
+        The endpoints are registered in the kiaconnect.ca bundle but the page
+        that calls them is not in the web app, so the body (PIN only, like the
+        other remote commands) is inferred.
+        """
+        path = (
+            "valet/activate"
+            if action == VALET_MODE_ACTION.ACTIVATE
+            else "valet/deactivate"
+        )
+        return self._ca_command(token, vehicle, path, {"pin": token.pin})
+
+    def set_last_service(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        odometer: float,
+        service_date: dt.date,
+        dealer_code: str | None = None,
+    ) -> str:
+        """Reset the service reminder (svcodmt), as the overview page's RESET does."""
+        body: dict[str, Any] = {
+            "serviceOdometer": odometer,
+            "serviceDate": service_date.strftime("%Y%m%d"),
+        }
+        if dealer_code:
+            body["dealerCode"] = dealer_code
+        headers, response_json = self._ca_call(token, vehicle, "svcodmt", body)
+        return cast(
+            str,
+            headers.get("transactionId") or response_json.get("transactionid") or "",
+        )
+
+    def set_vehicle_nickname(self, token: Token, vehicle: Vehicle, name: str) -> None:
+        """chngvhclncknm {vehicleId, newNickname}."""
+        self._ca_call(
+            token,
+            vehicle,
+            "chngvhclncknm",
+            {"vehicleId": vehicle.id, "newNickname": name},
+        )
+        vehicle.name = name
+
+    def get_climate_favourites(
+        self, token: Token, vehicle: Vehicle
+    ) -> list[dict[str, Any]]:
+        """Saved climate presets (gtfvsttng): id, settingName, defaultFavorite, ..."""
+        _, response_json = self._ca_call(token, vehicle, "gtfvsttng")
+        favourites = response_json.get("result") or []
+        if vehicle.data is None:
+            vehicle.data = {}
+        vehicle.data["climate_favourites"] = favourites
+        return cast(list[dict[str, Any]], favourites)
+
+    def save_climate_favourite(
+        self, token: Token, vehicle: Vehicle, setting: dict[str, Any]
+    ) -> None:
+        """svfvsttng {setting}; setting uses the start-climate body keys plus
+        id (0 for a new preset) and settingName (max 20 characters)."""
+        self._ca_call(token, vehicle, "svfvsttng", {"setting": setting})
+
+    def delete_climate_favourite(
+        self, token: Token, vehicle: Vehicle, favourite_id: int
+    ) -> None:
+        self._ca_call(token, vehicle, "rmfvsttng", {"id": favourite_id})
+
+    def set_default_climate_favourite(
+        self, token: Token, vehicle: Vehicle, favourite_id: int
+    ) -> None:
+        self._ca_call(token, vehicle, "svdefaultfvsttng", {"id": favourite_id})
+
+    def get_monthly_report_day(self, token: Token, vehicle: Vehicle) -> int | None:
+        """gtmvrdy -> {"day": "27"}."""
+        _, response_json = self._ca_call(token, vehicle, "gtmvrdy")
+        day = int_or_none(get_child_value(response_json, "result.day"))
+        vehicle.monthly_report_day = day
+        return day
+
+    def get_valet_mode(self, token: Token, vehicle: Vehicle) -> bool | None:
+        """valet/lastvaletstatus -> {"valetMode": n}.
+
+        A 2026 EV9 that was not in valet mode reported 1 (and vhcllst
+        valetParkingModeOn 1), so 1 is read as inactive and 0 as active.
+        Note the EU GSPA enum differs (0 active, 1 ign-off, 2 inactive).
+        """
+        _, response_json = self._ca_call(token, vehicle, "valet/lastvaletstatus")
+        mode = get_child_value(response_json, "result.valetMode")
+        vehicle.valet_mode_active = False if mode == 1 else True if mode == 0 else None
+        return vehicle.valet_mode_active
+
+    def get_preferred_dealer(self, token: Token, vehicle: Vehicle) -> dict[str, Any]:
+        """gtprfrdlr (POST): dealerCode, dealerName, address, tel, hours lists."""
+        _, response_json = self._ca_call(token, vehicle, "gtprfrdlr")
+        dealer = response_json.get("result") or {}
+        vehicle.preferred_dealer_name = dealer.get("dealerName")
+        if vehicle.data is None:
+            vehicle.data = {}
+        vehicle.data["preferred_dealer"] = dealer
+        return cast(dict[str, Any], dealer)
+
+    def get_notification_history(
+        self, token: Token, vehicle: Vehicle
+    ) -> list[dict[str, Any]]:
+        """v2/ntfhst -> {"notifications": [...]} for the selected vehicle."""
+        _, response_json = self._ca_call(token, vehicle, "v2/ntfhst")
+        notifications = get_child_value(response_json, "result.notifications") or []
+        if vehicle.data is None:
+            vehicle.data = {}
+        vehicle.data["notifications"] = notifications
+        return cast(list[dict[str, Any]], notifications)
+
+    def get_unread_message_count(self, token: Token, vehicle: Vehicle) -> int | None:
+        """ntcmsgcnt -> {"count": n} (Kia Connect notice messages)."""
+        _, response_json = self._ca_call(token, vehicle, "ntcmsgcnt")
+        vehicle.unread_message_count = int_or_none(
+            get_child_value(response_json, "result.count")
+        )
+        return vehicle.unread_message_count
+
+    def get_digital_key_status(self, token: Token, vehicle: Vehicle) -> dict[str, Any]:
+        """dkc/dkeystatus (GET): ownerDkeyInfo is set once the key is activated."""
+        _, response_json = self._ca_call(token, vehicle, "dkc/dkeystatus", method="GET")
+        result = response_json.get("result") or {}
+        owner = result.get("ownerDkeyInfo")
+        vehicle.digital_key_activated = bool(owner and owner.get("id"))
+        if vehicle.data is None:
+            vehicle.data = {}
+        vehicle.data["digital_key"] = result
+        return cast(dict[str, Any], result)
+
+    def get_subscription(self, token: Token, vehicle: Vehicle) -> dict[str, Any]:
+        """billing/retrieve/account/overview (GET): current Kia Connect package."""
+        _, response_json = self._ca_call(
+            token, vehicle, "billing/retrieve/account/overview", method="GET"
+        )
+        package = (
+            get_child_value(response_json, "result.currentPackage.currentPackage") or {}
+        )
+        vehicle.connect_plan_type = package.get("planType")
+        vehicle.connect_plan_status = package.get("status")
+        end = str(package.get("subscriptionEndDate") or "")[:10].replace("-", "")
+        if _ymd_date(end):
+            vehicle.connect_subscription_end_date = _ymd_date(end)
+        return cast(dict[str, Any], package)
+
+    _CA_EXTRAS_INTERVAL = dt.timedelta(hours=6)
+
+    def _update_account_extras(self, token: Token, vehicle: Vehicle) -> None:
+        """Slow-changing kiaconnect.ca data, refreshed at most every 6 hours.
+
+        Each call is independent; one failing never blocks the others or the
+        vehicle update.
+        """
+        if vehicle.data is None:
+            vehicle.data = {}
+        last = vehicle.data.get("_ca_extras_at")
+        now = time.time()
+        interval = self._CA_EXTRAS_INTERVAL.total_seconds()
+        if isinstance(last, (int, float)) and now - last < interval:
+            return
+        vehicle.data["_ca_extras_at"] = now
+        for fetch in (
+            self.get_valet_mode,
+            self.get_preferred_dealer,
+            self.get_unread_message_count,
+            self.get_notification_history,
+            self.get_digital_key_status,
+            self.get_subscription,
+            self.get_climate_favourites,
+            self.get_monthly_report_day,
+        ):
+            try:
+                fetch(token, vehicle)
+            except Exception as err:
+                _LOGGER.debug(f"{DOMAIN} - {fetch.__name__} failed: {err}")
+
+    def set_monthly_report_day(self, token: Token, vehicle: Vehicle, day: int) -> None:
+        """Day of the month the Monthly Vehicle Report is generated (svmvrdy)."""
+        self._ca_call(token, vehicle, "svmvrdy", {"day": day})
 
     def _mask_sensitive_data(self, data: dict[str, Any] | str) -> dict[str, Any] | str:
         """Create a copy of data with sensitive fields masked for logging."""

@@ -592,12 +592,14 @@ def test_ca_schedule_charge_payload(
     assert {"requests": sent_requests} == snapshot
 
 
-def test_ca_schedule_rejects_climate_scope(
+def test_ca_schedule_climate_scope_writes_departures(
     sent_requests: list[dict[str, Any]],
 ) -> None:
+    """The climate scope goes to reshvacset (kiaconnect.ca departures)."""
     api, token, vehicle = _ca_kia_ev()
-    with pytest.raises(NotImplementedError):
-        api.schedule_charging_and_climate(
-            token, vehicle, ScheduleChargingClimateRequestOptions(climate_enabled=True)
-        )
-    assert sent_requests == []
+    api.schedule_charging_and_climate(
+        token, vehicle, ScheduleChargingClimateRequestOptions(climate_enabled=True)
+    )
+    urls = [r["url"] for r in sent_requests]
+    assert urls[-1].endswith("v2/rc/ev/reshvacset")
+    assert not any(u.endswith("reschargeset") for u in urls)

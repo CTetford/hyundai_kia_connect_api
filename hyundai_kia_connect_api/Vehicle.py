@@ -253,6 +253,22 @@ class Vehicle:
     battery_auxiliary_fail_warning_is_on: bool | None = None
 
     # Service Data
+    # Service schedule dates/interval (CA nxtsvc: mtitServiceDate, mtspServiceDate,
+    # serviceOdometerDuration, serviceMonthsThreshold)
+    next_service_date: datetime.date | None = None
+    last_service_date: datetime.date | None = None
+    service_interval_distance: float | None = None
+    service_interval_months: int | None = None
+    # Connected-services subscription end date (CA vhcllst subscriptionEndDate)
+    connect_subscription_end_date: datetime.date | None = None
+    # Connected-services plan (CA billing overview): e.g. "Trial"/"Paid", "Active"
+    connect_plan_type: str | None = None
+    connect_plan_status: str | None = None
+    # Account extras (CA): preferred dealer, unread Kia messages, digital key
+    preferred_dealer_name: str | None = None
+    unread_message_count: int | None = None
+    digital_key_activated: bool | None = None
+    monthly_report_day: int | None = None
     _next_service_distance: float | None = None
     _next_service_distance_value: float | None = None
     _next_service_distance_unit: str | None = None

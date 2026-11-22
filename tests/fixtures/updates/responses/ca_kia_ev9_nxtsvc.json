@@ -1,0 +1,22 @@
+{
+  "responseHeader": {
+    "responseCode": 0,
+    "responseDesc": "Success"
+  },
+  "result": {
+    "maintenanceInfo": {
+      "msopServiceOdometer": 138.60000610351562,
+      "msopServiceOdometerUnit": 1,
+      "mtspServiceDate": "20260327",
+      "imatServiceOdometer": 13138.600006103516,
+      "imatServiceOdometerUnit": 1,
+      "mtitServiceDate": "20270327",
+      "currentOdometer": 27044.4,
+      "currentOdometerUnit": 1,
+      "currentOdometerOriginal": 27044.4,
+      "serviceOdometerDuration": 13000.0,
+      "serviceDaysDuration": 365,
+      "serviceMonthsThreshold": 12
+    }
+  }
+}
