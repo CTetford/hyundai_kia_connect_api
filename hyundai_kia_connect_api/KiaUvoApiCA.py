@@ -2004,10 +2004,45 @@ class KiaUvoApiCA(ApiImpl):
         return cast(list[dict[str, Any]], favourites)
 
     def save_climate_favourite(
-        self, token: Token, vehicle: Vehicle, setting: dict[str, Any]
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        name: str,
+        options: ClimateRequestOptions,
+        favourite_id: int = 0,
     ) -> None:
-        """svfvsttng {setting}; setting uses the start-climate body keys plus
-        id (0 for a new preset) and settingName (max 20 characters)."""
+        """Create (id 0) or update a saved climate preset (svfvsttng {setting}).
+
+        The setting uses the start-climate keys, named as kiaconnect.ca saves
+        them; name is limited to 20 characters by the portal.
+        """
+        table = (
+            self.temperature_range_c_new
+            if vehicle.year is not None
+            and vehicle.year >= self.temperature_range_model_year
+            else self.temperature_range_c_old
+        )
+        temperature = options.set_temp if options.set_temp in table else 21.0
+        setting: dict[str, Any] = {
+            "id": favourite_id,
+            "settingName": name[:20],
+            "airCtrl": 1 if options.climate in (None, True) else 0,
+            "defrost": bool(options.defrost),
+            "airTemp": {
+                "value": get_index_into_hex_temp(table.index(temperature)),
+                "unit": 0,
+                "hvacTempType": 1,
+            },
+            "igniOnDuration": options.duration or 10,
+            "heating1": options.heating or 0,
+            "seatHeaterVentCMD": {
+                "drvSeatOptCmd": options.front_left_seat or 0,
+                "astSeatOptCmd": options.front_right_seat or 0,
+                "rlSeatOptCmd": options.rear_left_seat or 0,
+                "rrSeatOptCmd": options.rear_right_seat or 0,
+            },
+        }
+        _add_steering_wheel_step(setting, options)
         self._ca_call(token, vehicle, "svfvsttng", {"setting": setting})
 
     def delete_climate_favourite(

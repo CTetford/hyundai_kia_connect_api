@@ -12,7 +12,10 @@ from typing import Any
 
 import pytest
 
-from hyundai_kia_connect_api.ApiImpl import ScheduleChargingClimateRequestOptions
+from hyundai_kia_connect_api.ApiImpl import (
+    ClimateRequestOptions,
+    ScheduleChargingClimateRequestOptions,
+)
 from hyundai_kia_connect_api.const import ENGINE_TYPES, VALET_MODE_ACTION
 from hyundai_kia_connect_api.KiaUvoApiCA import KiaUvoApiCA
 from hyundai_kia_connect_api.Token import Token
@@ -221,13 +224,26 @@ def test_set_vehicle_nickname(sent) -> None:
 
 def test_climate_favourite_calls(sent) -> None:
     api, token, vehicle = _api(), _token(), _vehicle()
-    api.save_climate_favourite(token, vehicle, {"id": 0, "settingName": "Max"})
+    api.save_climate_favourite(
+        token,
+        vehicle,
+        "Max heat for the whole family",
+        ClimateRequestOptions(
+            set_temp=22.0, heating=4, steering_wheel=2, front_left_seat=8
+        ),
+    )
     api.delete_climate_favourite(token, vehicle, 3)
     api.set_default_climate_favourite(token, vehicle, 2)
     api.set_monthly_report_day(token, vehicle, 15)
     paths = [c["url"].rsplit("/", 1)[-1] for c in sent]
     assert paths == ["svfvsttng", "rmfvsttng", "svdefaultfvsttng", "svmvrdy"]
-    assert _body(sent[0]) == {"setting": {"id": 0, "settingName": "Max"}}
+    setting = _body(sent[0])["setting"]
+    assert setting["id"] == 0
+    assert setting["settingName"] == "Max heat for the whol"[:20]
+    assert setting["airTemp"] == {"value": "10H", "unit": 0, "hvacTempType": 1}
+    assert setting["steerWheelHeat_step2"] == 2
+    assert setting["sideBackWindowHeat"] == 1
+    assert setting["seatHeaterVentCMD"]["drvSeatOptCmd"] == 8
     assert _body(sent[1]) == {"id": 3}
     assert _body(sent[3]) == {"day": 15}
 
