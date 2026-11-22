@@ -351,16 +351,26 @@ def test_charge_limits_keep_setsoc_for_older_generations(sent) -> None:
 @pytest.mark.parametrize(
     ("result", "active"),
     [
+        # Live 2026 EV9 sequence: before, after activate, after deactivate
         ({"valetMode": 1}, False),
-        ({"valetMode": 1, "startDate": "20261122035915"}, True),
         (
             {
-                "valetMode": 1,
+                "valetMode": 0,
                 "startDate": "20261122035915",
                 "deactivatedDate": "20261122040016",
             },
+            True,
+        ),
+        (
+            {
+                "valetMode": 1,
+                "startDate": "20261122041135",
+                "deactivatedDate": "20261122041313",
+            },
             False,
         ),
+        ({"startDate": "20261122041135"}, True),  # no valetMode: session fallback
+        ({}, None),
     ],
 )
 def test_valet_status_from_session_log(reply, result, active) -> None:

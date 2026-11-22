@@ -2120,18 +2120,25 @@ class KiaUvoApiCA(ApiImpl):
         return day
 
     def get_valet_mode(self, token: Token, vehicle: Vehicle) -> bool | None:
-        """valet/lastvaletstatus: the last valet session.
+        """valet/lastvaletstatus: valetMode 0 = active, 1 = inactive.
 
-        valetMode is not an on/off flag: a 2026 EV9 reported 1 before, during
-        and after a session. A session is active when it has a startDate and
-        no deactivatedDate (verified with a live activate/deactivate).
+        Verified live on a 2026 EV9: 1 before any session, 0 after activate,
+        1 again after deactivate. startDate/deactivatedDate describe the last
+        completed session and only update when it ends, so they are a
+        fallback only. (The EU GSPA enum differs: 0 active, 1 ign-off,
+        2 inactive.)
         """
         _, response_json = self._ca_call(token, vehicle, "valet/lastvaletstatus")
         result = response_json.get("result") or {}
-        if result.get("startDate"):
+        mode = result.get("valetMode")
+        if mode == 0:
+            vehicle.valet_mode_active = True
+        elif mode == 1:
+            vehicle.valet_mode_active = False
+        elif result.get("startDate"):
             vehicle.valet_mode_active = not result.get("deactivatedDate")
         else:
-            vehicle.valet_mode_active = False  # no session recorded
+            vehicle.valet_mode_active = None
         return vehicle.valet_mode_active
 
     def get_preferred_dealer(self, token: Token, vehicle: Vehicle) -> dict[str, Any]:
