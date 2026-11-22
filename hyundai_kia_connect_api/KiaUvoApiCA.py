@@ -58,6 +58,7 @@ from .utils import (
     get_child_value,
     get_hex_temp_into_index,
     get_index_into_hex_temp,
+    int_or_none,
     normalize_battery_soc,
     offset_from_tz,
     parse_datetime,
@@ -97,6 +98,22 @@ def _reservation_time_body(value: dt.time) -> dict[str, Any]:
         "time": value.strftime("%I%M"),
         "timeSection": 1 if value >= dt.time(12, 0) else 0,
     }
+
+
+def _add_steering_wheel_step(
+    body: dict[str, Any], options: ClimateRequestOptions
+) -> None:
+    """Send the heated wheel level the way kiaconnect.ca does.
+
+    Cars with a 2-step wheel (feature StrgWhlHeatingOption 2) take the level as
+    steerWheelHeat_step2 (0 off, 1 low, 2 high) and the side/back defrosters as
+    a separate sideBackWindowHeat flag. Only added when steering_wheel is set,
+    so requests from callers that don't use it are unchanged.
+    """
+    if options.steering_wheel is None:
+        return
+    body["steerWheelHeat_step2"] = int(options.steering_wheel)
+    body["sideBackWindowHeat"] = 1 if options.heating in (1, 2, 4) else 0
 
 
 def create_session_ticket_context() -> ssl.SSLContext:
@@ -961,6 +978,10 @@ class KiaUvoApiCA(ApiImpl):
         vehicle.steering_wheel_heater_is_on = get_child_value(
             state, "status.steerWheelHeat"
         )
+        # 2-step wheels (StrgWhlHeatingOption 2) report 0 off, 1 low, 2 high
+        vehicle.steering_wheel_heat_step = int_or_none(
+            get_child_value(state, "status.steerWheelHeat_step2")
+        )
         vehicle.back_window_heater_is_on = get_child_value(
             state, "status.sideBackWindowHeat"
         )
@@ -1405,6 +1426,7 @@ class KiaUvoApiCA(ApiImpl):
                     },
                 },
             }
+            _add_steering_wheel_step(payload[body_key], options)
         else:
             payload = {
                 "setting": {
@@ -1423,6 +1445,7 @@ class KiaUvoApiCA(ApiImpl):
                 },
                 "pin": token.pin,
             }
+            _add_steering_wheel_step(payload["setting"], options)
         response_headers, response = self._post_start_climate(url, headers, payload)
         error = response.get("error")
         retry = (
