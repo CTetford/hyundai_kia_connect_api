@@ -1736,6 +1736,19 @@ class KiaUvoApiCA(ApiImpl):
     def set_charge_limits(
         self, token: Token, vehicle: Vehicle, ac: int, dc: int
     ) -> str:
+        if vehicle.generation == "G3":
+            # CCS2 (Gen3) vehicles: kiaconnect.ca switches to the reservation
+            # endpoint with targetSOClist (isCCS2Vehicle in the web app). A
+            # 2026 EV9 rejected evc/setsoc (7999) and accepted this (RMT-E0203,
+            # apiResult C).
+            payload = {
+                "pin": token.pin,
+                "targetSOClist": [
+                    {"plugType": 0, "targetSOClevel": dc},
+                    {"plugType": 1, "targetSOClevel": ac},
+                ],
+            }
+            return self._ca_command(token, vehicle, "v2/ev/reserv/socset", payload)
         url = self.API_URL + "evc/setsoc"
         headers = self.API_HEADERS.copy()
         headers["accessToken"] = token.access_token
@@ -1809,6 +1822,12 @@ class KiaUvoApiCA(ApiImpl):
         Each scope is only sent when one of its options was given. When both
         are given, the charge window is written first and the departure
         transaction id is returned.
+
+        The bodies match kiaconnect.ca byte for byte. On a 2026 EV9 (CCS2,
+        G3) both endpoints accept the request and the vehicle then fails the
+        transaction (RMT-E0208 charge / RMT-E0209 departures, status 7999)
+        even for an unchanged schedule, and kiaconnect.ca's own Submit fails
+        the same way, so the failure surfaces through the action status.
         """
         charge_active, climate_active = _schedule_charging_scopes(options)
         if not charge_active and not climate_active:

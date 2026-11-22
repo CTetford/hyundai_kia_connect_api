@@ -317,3 +317,26 @@ def test_account_extras_survive_failures(monkeypatch) -> None:
     vehicle = _vehicle()
     _api()._update_account_extras(_token(), vehicle)  # must not raise
     assert vehicle.preferred_dealer_name is None
+
+
+def test_charge_limits_use_socset_for_ccs2(sent) -> None:
+    """Gen3/CCS2 cars use v2/ev/reserv/socset like kiaconnect.ca does."""
+    tx = _api().set_charge_limits(_token(), _vehicle(), ac=90, dc=100)
+    assert tx == "TX-1"
+    call = sent[-1]
+    assert call["url"].endswith("v2/ev/reserv/socset")
+    assert call["headers"]["pAuth"] == "x"
+    assert _body(call) == {
+        "pin": "1234",
+        "targetSOClist": [
+            {"plugType": 0, "targetSOClevel": 100},
+            {"plugType": 1, "targetSOClevel": 90},
+        ],
+    }
+
+
+def test_charge_limits_keep_setsoc_for_older_generations(sent) -> None:
+    vehicle = _vehicle()
+    vehicle.generation = "G2"
+    _api().set_charge_limits(_token(), vehicle, ac=80, dc=70)
+    assert sent[-1]["url"].endswith("evc/setsoc")
